@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import toast from 'react-hot-toast';
-import { Card, Field, Row, BigResult, CalcButton, Toggle, UnitsGrid } from './Shared.jsx';
+import { Card, Field, Row, BigResult, CalcButton, Toggle, UnitsGrid } from './shared.jsx';
 import { toGB, allUnits, fmt, calcDWR, calcSnapshot } from '../utils/engine.js';
 
 function SnapshotTab() {
