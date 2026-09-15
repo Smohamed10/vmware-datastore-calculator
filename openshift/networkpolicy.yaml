@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vcapacity-ingress
+  labels:
+    app: vcapacity
+spec:
+  podSelector:
+    matchLabels:
+      app: vcapacity
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the OpenShift router may reach the pods.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+      ports:
+        - port: 8080
+          protocol: TCP

@@ -1,0 +1,16 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: vcapacity
+  labels:
+    app: vcapacity
+spec:
+  # host: vcapacity.apps.your-cluster.example.com   # ← set per environment
+  to:
+    kind: Service
+    name: vcapacity
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
