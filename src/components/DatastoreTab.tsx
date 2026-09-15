@@ -1,892 +1,663 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+/**
+ * TAB 1 — Capacity Assessment (single datastore).
+ * Fully live: results recompute as the user types; linked fields derive
+ * from each other unless the user takes manual control —
+ *   Used space      ← Current total − Current free   (until typed over)
+ *   Current total   ← Datastore capacity             (until typed over)
+ *   Overhead reserve← 10% × Datastore capacity       (until typed over)
+ * Two input methods: Manual entry | RVTools import (auto-fill stays editable).
+ * Numbers entering inputs always pass through num() — never fmt() — so
+ * locale-formatted strings (17,367.8) can never silently truncate values.
+ */
+import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import toast from "react-hot-toast";
-import { AlertTriangle, Building2, Database, FileDown, Server } from "lucide-react";
+import { CircleX, FileSpreadsheet, Gauge, ImageDown, Keyboard, Link2, ShieldCheck, ShieldX, Unlink2 } from "lucide-react";
 import { APP, POLICY } from "../config/policy";
 import {
-  allUnits, calcDatastore, calcHealth, fmt, toGB,
-  type DatastoreResult, type HealthStatus, type Severity, type Unit, type UnitValue,
+  allUnits, calcDatastore, calcHealth, fmt, num, smartUnit, toGB, UNITS,
+  type DatastoreResult, type HealthStatus, type UnitValue,
 } from "../lib/engine";
-import { usePersistentState } from "../lib/persist";
-import { nextReportRef } from "../lib/reportRef";
 import { runPreChecks } from "../lib/validation";
-import { BigResult, CalcButton, Card, Field, Progress, Row, SectionLabel, StatusPanel, Toggle, UnitsGrid } from "./ui";
+import { clearPersisted, usePersistentState } from "../lib/persist";
+import { parseWorkbookFile, RVTOOLS_PARSER_VERSION, type RVInventory } from "../lib/bulk";
+import { clearInventory, setInventory, useInventorySlot } from "../lib/inventoryStore";
+import { exportAssessmentPng } from "../lib/report";
+import {
+  AnimatedValue, Card, Chip, ClearButton, EmptyState, FieldLabel, GhostButton, InfoBanner, InfoDot,
+  LiveBadge, Meter, NumField, ResultRow, SectionLabel, Segmented, StatusPill, TextField, Tip, Toggle,
+} from "./ui";
+import FileDrop from "./FileDrop";
 
-const UV = (u: Unit = "GB"): UnitValue => ({ v: "", u });
-const EMPTY_CHECKS: { errors: never[]; warnings: string[] } = { errors: [], warnings: [] };
-
-/** Overhead reserve derived from capacity under policy (unit-smart). */
-function deriveOverhead(capGB: number): UnitValue {
-  const o = capGB * POLICY.overheadPercent;
-  if (o <= 0) return UV();
-  if (o >= 1024) return { v: (o / 1024).toFixed(4), u: "TB" };
-  if (o < 0.001) return { v: (o * 1024 * 1024).toFixed(4), u: "KB" };
-  if (o < 1) return { v: (o * 1024).toFixed(4), u: "MB" };
-  return { v: o.toFixed(4), u: "GB" };
+interface AssessmentDone {
+  sizing: DatastoreResult;
+  health: HealthStatus | null;
+  echo: {
+    datastoreName: string; cluster: string; naaLunId: string;
+    usedGB: number; ramGB: number; dsCapGB: number; snapGB: number;
+    curTotGB: number; curFreeGB: number; buffer: number; memSnap: boolean;
+    source: "manual" | "rvtools";
+  };
 }
 
+const uv = (v = "", u: UnitValue["u"] = "GB"): UnitValue => ({ v, u });
+const stripCommas = (u: UnitValue): UnitValue => (u.v.includes(",") ? { ...u, v: u.v.replace(/,/g, "") } : u);
+
+const DEFAULTS = {
+  dsName: "", cluster: "", naaLunId: "",
+  used: uv(), ram: uv(), dsCap: uv(), snap: uv(), curTot: uv(), curFree: uv(),
+  buf: String(POLICY.safetyBuffer), memSnap: false, method: "manual" as "manual" | "rvtools",
+};
+
 export default function DatastoreTab() {
-  const [dsName, setDsName] = usePersistentState("ds.name", "");
-  const [cluster, setCluster] = usePersistentState("ds.cluster", "");
-  const [used, setUsed] = usePersistentState<UnitValue>("ds.used", UV());
-  const [ram, setRam] = usePersistentState<UnitValue>("ds.ram", UV());
-  const [dsCap, setDsCap] = usePersistentState<UnitValue>("ds.cap", UV("TB"));
-  const [snap, setSnap] = usePersistentState<UnitValue>("ds.snap", UV());
-  const [buf, setBuf] = usePersistentState("ds.buf", String(POLICY.safetyBuffer));
-  const [curTot, setCurTot] = usePersistentState<UnitValue>("ds.curTot", UV("TB"));
-  const [curFree, setCurFree] = usePersistentState<UnitValue>("ds.curFree", UV());
-  const [memSnap, setMemSnap] = usePersistentState("ds.memSnap", false);
-  const [overridden, setOverridden] = usePersistentState("ds.overridden", false);
+  const [method, setMethod] = usePersistentState<"manual" | "rvtools">("cap.method", DEFAULTS.method);
+  const [dsName, setDsName] = usePersistentState("cap.dsName", DEFAULTS.dsName);
+  const [cluster, setCluster] = usePersistentState("cap.cluster", DEFAULTS.cluster);
+  const [naaLunId, setNaaLunId] = usePersistentState("cap.naaLunId", DEFAULTS.naaLunId);
+  const [used, setUsed] = usePersistentState<UnitValue>("cap.used", DEFAULTS.used);
+  const [ram, setRam] = usePersistentState<UnitValue>("cap.ram", DEFAULTS.ram);
+  const [dsCap, setDsCap] = usePersistentState<UnitValue>("cap.dsCap", DEFAULTS.dsCap);
+  const [snap, setSnap] = usePersistentState<UnitValue>("cap.snap", DEFAULTS.snap);
+  const [curTot, setCurTot] = usePersistentState<UnitValue>("cap.curTot", DEFAULTS.curTot);
+  const [curFree, setCurFree] = usePersistentState<UnitValue>("cap.curFree", DEFAULTS.curFree);
+  const [buf, setBuf] = usePersistentState("cap.buf", DEFAULTS.buf);
+  const [memSnap, setMemSnap] = usePersistentState("cap.memSnap", DEFAULTS.memSnap);
 
-  const [result, setResult] = useState<DatastoreResult | null>(null);
-  const [health, setHealth] = useState<HealthStatus | null>(null);
-  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-  const [exporting, setExporting] = useState(false);
+  /* link locks: false = field follows its source; true = user owns it */
+  const [usedManual, setUsedManual] = usePersistentState("cap.usedManual", false);
+  const [curTotManual, setCurTotManual] = usePersistentState("cap.curTotManual", false);
+  const [snapManual, setSnapManual] = usePersistentState("cap.snapManual", false);
 
-  /* Policy-derived overhead — follows capacity until the user overrides it.
-     An override is never silently destroyed by a capacity change. */
+  const [busy, setBusy] = useState(false);
+
+  /* RVTools side-channel — the parsed inventory lives in the session store
+     so leaving this tab and returning keeps the workbook loaded. */
+  const slot = useInventorySlot("capacity");
+  const inv = slot?.inventory ?? null;
+  const rvFile = slot?.fileName ?? "";
+  const rvSource = slot?.source ?? "rvtools";
+  const [rvDs, setRvDs] = usePersistentState("cap.rvDs", "");
+  const [autoFilled, setAutoFilled] = usePersistentState("cap.autoFilled", false);
+
+  /* ── one-time heal: purge locale-comma strings persisted by older builds ── */
   useEffect(() => {
-    if (overridden) return;
-    setSnap(deriveOverhead(toGB(dsCap.v, dsCap.u)));
-  }, [dsCap.v, dsCap.u, overridden, setSnap]);
+    setUsed(stripCommas); setRam(stripCommas); setDsCap(stripCommas);
+    setSnap(stripCommas); setCurTot(stripCommas); setCurFree(stripCommas);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  function editSnap(v: string) {
-    setSnap({ v, u: snap.u });
-    setOverridden(true);
-    setFieldErrors({});
-  }
-  function resetSnap() {
-    setOverridden(false); // effect recomputes the policy value
-  }
+  /* ── derived numbers ── */
+  const dsCapGB = toGB(dsCap.v, dsCap.u);
+  const derivedReserveGB = +(dsCapGB * POLICY.overheadPercent).toFixed(2);
+  const snapGB = snap.v ? toGB(snap.v, snap.u) : derivedReserveGB;
+  const curTotGB = toGB(curTot.v, curTot.u);
+  const curFreeGB = toGB(curFree.v, curFree.u);
+  const overheadOverridden = snapManual && dsCapGB > 0 && Math.abs(snapGB - derivedReserveGB) > 0.001;
 
-  const preChecks = useMemo(() => {
-    const any = used.v || ram.v || dsCap.v || curTot.v || curFree.v;
-    if (!any) return EMPTY_CHECKS;
-    return runPreChecks({ used, ram, dsCap, snap, curTot, curFree, buf, memSnap });
-  }, [used, ram, dsCap, snap, curTot, curFree, buf, memSnap]);
+  /* ── linked-field derivation (runs until the user takes control) ── */
+  useEffect(() => {
+    if (!snapManual && dsCapGB > 0) setSnap({ v: num(dsCapGB * POLICY.overheadPercent, 2), u: "GB" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dsCapGB, snapManual]);
 
-  const livePreview = useMemo(() => {
-    const u = toGB(used.v, used.u);
-    const r = toGB(ram.v, ram.u);
-    const sn = toGB(snap.v, snap.u);
-    if (u <= 0 && r <= 0 && sn <= 0) return null;
-    return fmt((u + (memSnap ? r * 2 : r) + sn) * (parseFloat(buf) || POLICY.safetyBuffer), 2);
-  }, [used, ram, snap, buf, memSnap]);
+  useEffect(() => {
+    if (!curTotManual && dsCapGB > 0) setCurTot({ v: num(dsCapGB, 2), u: dsCap.u });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dsCapGB, dsCap.u, curTotManual]);
 
-  function calculate() {
-    const check = runPreChecks({ used, ram, dsCap, snap, curTot, curFree, buf, memSnap });
+  useEffect(() => {
+    if (!usedManual && curTotGB > 0 && curFreeGB >= 0 && curFreeGB <= curTotGB && (curFree.v !== "")) {
+      setUsed({ v: num(curTotGB - curFreeGB, 2), u: "GB" });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [curTotGB, curFreeGB, curFree.v, usedManual]);
 
-    const fErrs: Record<string, string> = {};
-    check.errors.forEach((e) => {
-      if (e.field) fErrs[e.field] = e.msg;
+  /* ── validation + LIVE result ── */
+  const pre = useMemo(
+    () =>
+      runPreChecks({
+        used, ram, dsCap, snap: snap.v ? snap : uv(String(derivedReserveGB), "GB"),
+        curTot, curFree, buf, memSnap,
+      }),
+    [used, ram, dsCap, snap, derivedReserveGB, curTot, curFree, buf, memSnap]
+  );
+  const anyValue = !!(used.v || ram.v || dsCap.v || curTot.v || curFree.v);
+  const invalid = (field: string) => anyValue && pre.errors.some((e) => e.field === field);
+
+  const live = useMemo<AssessmentDone | null>(() => {
+    if (pre.errors.length > 0) return null;
+    const sizing = calcDatastore({
+      usedGB: toGB(used.v, used.u), ramGB: toGB(ram.v, ram.u),
+      snapGB, buffer: parseFloat(buf), memSnap,
     });
-    setFieldErrors(fErrs);
+    const health = calcHealth(curTotGB || dsCapGB, curFreeGB, sizing.required, snapGB);
+    return {
+      sizing, health,
+      echo: {
+        datastoreName: dsName.trim(), cluster: cluster.trim(), naaLunId: naaLunId.trim(),
+        usedGB: toGB(used.v, used.u), ramGB: toGB(ram.v, ram.u), dsCapGB, snapGB,
+        curTotGB: curTotGB || dsCapGB, curFreeGB, buffer: parseFloat(buf), memSnap,
+        source: method === "rvtools" && autoFilled ? "rvtools" : "manual",
+      },
+    };
+  }, [pre, used, ram, snapGB, buf, memSnap, curTotGB, dsCapGB, curFreeGB, dsName, cluster, naaLunId, method, autoFilled]);
 
-    if (check.errors.length > 0) {
-      toast.error("Resolve the highlighted fields to continue");
-      return;
-    }
-    check.warnings.slice(0, 3).forEach((w) =>
-      toast(w, {
-        icon: <AlertTriangle size={15} color="#F59E0B" />,
-        duration: 6000,
-        style: { maxWidth: 480, fontSize: 13 },
-      })
-    );
-
-    const ds = calcDatastore({
-      usedGB: toGB(used.v, used.u),
-      ramGB: toGB(ram.v, ram.u),
-      snapGB: toGB(snap.v, snap.u),
-      buffer: parseFloat(buf) || POLICY.safetyBuffer,
-      memSnap,
-    });
-    setResult(ds);
-
-    const ctGB = toGB(curTot.v, curTot.u);
-    setHealth(ctGB > 0 ? calcHealth(ctGB, toGB(curFree.v, curFree.u), ds.required, toGB(snap.v, snap.u)) : null);
-  }
-
-  /* ── Canvas report render ─────────────────────────────────── */
-  function exportReport() {
-    if (!result) {
-      toast.error("Run the calculation first");
-      return;
-    }
-    if (!health) {
-      toast.error("Enter current capacity and free space to generate a report");
-      return;
-    }
-    setExporting(true);
+  /* ── actions ── */
+  async function importWorkbook(file: File) {
+    setBusy(true);
     try {
-      const ref = nextReportRef("VCA");
-      const isDark = document.documentElement.getAttribute("data-theme") !== "light";
-      const units = allUnits(result.required);
-
-      const W = 1240;
-      const H = 1120;
-      const canvas = document.createElement("canvas");
-      canvas.width = W;
-      canvas.height = H;
-      const ctx = canvas.getContext("2d")!;
-
-      const C = isDark
-        ? { bg: "#070A12", card: "#0D1322", card2: "#131A2E", border: "#1E2640", t0: "#FFFFFF", t1: "#EDEFF7", t2: "#B9C1D9", t3: "#8A94B0", t4: "#5A647E", bar: "#1A2035" }
-        : { bg: "#F2F4F8", card: "#FFFFFF", card2: "#F3F5FB", border: "#D9DEE9", t0: "#0E1220", t1: "#1C2236", t2: "#3A4160", t3: "#5C6580", t4: "#8890A8", bar: "#E3E7EF" };
-      const gold = isDark ? "#C9A84C" : "#A8842F";
-      const maroon = isDark ? "#7A1B37" : "#6D1932";
-      const sevColor: Record<Severity, string> = { success: "#22C55E", warning: "#F59E0B", danger: "#EF4444" };
-      const sc = sevColor[health.sev];
-      const projSev: Severity =
-        health.projectedFreePct >= POLICY.freeSpace.approvedPct
-          ? "success"
-          : health.projectedFreePct >= POLICY.freeSpace.warningPct
-            ? "warning"
-            : "danger";
-      const psc = sevColor[projSev];
-
-      ctx.fillStyle = C.bg;
-      ctx.fillRect(0, 0, W, H);
-
-      /* header */
-      const strip = ctx.createLinearGradient(0, 0, W, 0);
-      strip.addColorStop(0, maroon);
-      strip.addColorStop(1, gold);
-      ctx.fillStyle = strip;
-      ctx.fillRect(0, 0, W, 6);
-      ctx.fillStyle = C.card;
-      ctx.fillRect(0, 6, W, 110);
-      ctx.fillStyle = C.border;
-      ctx.fillRect(0, 115, W, 1);
-      ctx.fillStyle = gold;
-      ctx.font = 'bold 30px "Segoe UI", Arial, sans-serif';
-      ctx.fillText("Datastore Capacity Assessment", 44, 58);
-      ctx.fillStyle = C.t3;
-      ctx.font = '14px "Segoe UI", Arial, sans-serif';
-      ctx.fillText(`${APP.orgLine1}  ·  ${APP.orgLine2}`, 44, 86);
-      ctx.textAlign = "right";
-      ctx.fillStyle = C.t4;
-      ctx.font = 'bold 14px "JetBrains Mono", Consolas, monospace';
-      ctx.fillText(ref, W - 44, 52);
-      ctx.font = '13px "JetBrains Mono", Consolas, monospace';
-      ctx.fillText(new Date().toLocaleString(), W - 44, 76);
-      ctx.fillStyle = isDark ? "#C4757F" : "#8E2438";
-      ctx.font = 'bold 11px "Segoe UI", Arial, sans-serif';
-      ctx.fillText(APP.classification, W - 44, 98);
-      ctx.textAlign = "left";
-
-      /* identity band */
-      const iY = 132;
-      chip(ctx, 44, iY, "DATASTORE", dsName || "—", C, gold);
-      chip(ctx, 44 + 420, iY, "CLUSTER / VCENTER", cluster || "—", C, gold);
-      ctx.textAlign = "right";
-      ctx.fillStyle = C.t4;
-      ctx.font = '12px "Segoe UI", Arial, sans-serif';
-      ctx.fillText(`${APP.name} v${APP.version}`, W - 44, iY + 30);
-      ctx.textAlign = "left";
-
-      /* status box */
-      const sY = 208;
-      ctx.fillStyle = sc + (isDark ? "18" : "12");
-      rr(ctx, 44, sY, W - 88, 100, 16);
-      ctx.fill();
-      ctx.strokeStyle = sc + "55";
-      ctx.lineWidth = 2;
-      rr(ctx, 44, sY, W - 88, 100, 16);
-      ctx.stroke();
-      ctx.fillStyle = sc;
-      ctx.font = 'bold 24px "Segoe UI", Arial, sans-serif';
-      ctx.fillText(`STATUS: ${health.status}`, 70, sY + 40);
-      ctx.fillStyle = C.t2;
-      ctx.font = '14px "Segoe UI", Arial, sans-serif';
-      wt(ctx, health.msg, 70, sY + 66, W - 160, 20);
-
-      /* metric tiles */
-      const mY = 328;
-      const mets = [
-        { l: "FREE SPACE NOW", v: `${health.freePct}%`, c: sc },
-        { l: "PROJECTED FREE AT PEAK", v: `${health.projectedFreePct}%`, c: psc },
-        { l: "FREE", v: `${fmt(health.freeGB, 2)} GB`, c: C.t1 },
-        { l: "TOTAL", v: `${fmt(health.totalGB, 2)} GB`, c: C.t1 },
-      ];
-      const mw = (W - 88 - 30) / 4;
-      mets.forEach((m, i) => {
-        const x = 44 + i * (mw + 10);
-        ctx.fillStyle = C.card2;
-        rr(ctx, x, mY, mw, 84, 12);
-        ctx.fill();
-        ctx.strokeStyle = C.border;
-        ctx.lineWidth = 1;
-        rr(ctx, x, mY, mw, 84, 12);
-        ctx.stroke();
-        ctx.fillStyle = C.t4;
-        ctx.font = 'bold 10px "Segoe UI", Arial, sans-serif';
-        ctx.fillText(m.l, x + 16, mY + 26);
-        ctx.fillStyle = m.c;
-        ctx.font = 'bold 23px "Segoe UI", Arial, sans-serif';
-        ctx.fillText(m.v, x + 16, mY + 60);
-      });
-
-      /* bars */
-      const bY = 446;
-      ctx.fillStyle = C.t4;
-      ctx.font = 'bold 10px "Segoe UI", Arial, sans-serif';
-      ctx.fillText("CURRENT UTILIZATION", 44, bY - 10);
-      ctx.fillText(`POLICY LINE — ${POLICY.freeSpace.approvedPct}% FREE`, W / 2 + 176, bY - 10);
-      bar(ctx, 44, bY, W - 88, 13, health.usedPct, sc, C.bar);
-      marker(ctx, 44, bY, W - 88, 13, 100 - POLICY.freeSpace.approvedPct, C.t4);
-
-      const pY = bY + 46;
-      ctx.fillStyle = C.t4;
-      ctx.fillText("PROJECTED FREE SPACE AT PEAK SNAPSHOT CONSUMPTION", 44, pY - 10);
-      bar(ctx, 44, pY, W - 88, 13, Math.max(health.projectedFreePct, 0), psc, C.bar);
-      marker(ctx, 44, pY, W - 88, 13, POLICY.freeSpace.approvedPct, C.t4);
-      ctx.fillStyle = C.t3;
-      ctx.font = '12px "JetBrains Mono", Consolas, monospace';
-      ctx.fillText(
-        `peak snapshot demand ${fmt(health.demandGB, 2)} GB  →  projected free ${fmt(health.projectedFreeGB, 2)} GB (${health.projectedFreePct}%)`,
-        44,
-        pY + 32
-      );
-
-      /* sizing breakdown */
-      const tY = 560;
-      ctx.fillStyle = gold;
-      ctx.font = 'bold 18px "Segoe UI", Arial, sans-serif';
-      ctx.fillText("Sizing Breakdown", 44, tY);
-      const rows: [string, string][] = [
-        ["Datastore Used", `${fmt(result.usedGB, 2)} GB`],
-        [`VM RAM${result.memSnap ? " (×2 — memory state)" : ""}`, `${fmt(result.ramGB, 2)} GB`],
-        [
-          `Snapshot Overhead (${overridden ? "manual override" : `${Math.round(POLICY.overheadPercent * 100)}% policy reserve`})`,
-          `${fmt(result.snapGB, 2)} GB`,
-        ],
-        ["Raw Sum", `${fmt(result.raw, 2)} GB`],
-        [`Safety Buffer (+${fmt(result.bufferPct, 0)}%)`, `+${fmt(result.padding, 2)} GB`],
-      ];
-      rows.forEach((r, i) => {
-        const y = tY + 30 + i * 30;
-        ctx.fillStyle = C.t2;
-        ctx.font = '14px "Segoe UI", Arial, sans-serif';
-        ctx.fillText(r[0], 64, y);
-        ctx.fillStyle = C.t0;
-        ctx.font = 'bold 14px "JetBrains Mono", Consolas, monospace';
-        ctx.textAlign = "right";
-        ctx.fillText(r[1], W / 2 + 80, y);
-        ctx.textAlign = "left";
-      });
-
-      const rY = tY + 200;
-      ctx.fillStyle = maroon + (isDark ? "26" : "0D");
-      rr(ctx, 44, rY, W - 88, 86, 14);
-      ctx.fill();
-      ctx.strokeStyle = gold + (isDark ? "50" : "40");
-      ctx.lineWidth = 1.5;
-      rr(ctx, 44, rY, W - 88, 86, 14);
-      ctx.stroke();
-      ctx.textAlign = "center";
-      ctx.fillStyle = C.t4;
-      ctx.font = 'bold 10px "Segoe UI", Arial, sans-serif';
-      ctx.fillText("REQUIRED DATASTORE CAPACITY", W / 2, rY + 24);
-      ctx.fillStyle = gold;
-      ctx.font = 'bold 32px "JetBrains Mono", Consolas, monospace';
-      ctx.fillText(`${fmt(result.required, 2)} GB`, W / 2, rY + 60);
-      ctx.fillStyle = C.t3;
-      ctx.font = '13px "JetBrains Mono", Consolas, monospace';
-      ctx.fillText(`${fmt(units.TB, 4)} TB   ·   ${fmt(units.MB, 0)} MB`, W / 2, rY + 79);
-      ctx.textAlign = "left";
-
-      /* decisions */
-      const dY = rY + 106;
-      const decs = [
-        {
-          l: "SNAPSHOT AUTHORIZATION",
-          v: health.snapAuthorized ? "AUTHORIZED" : "DENIED",
-          c: health.snapAuthorized ? sevColor.success : sevColor.danger,
-        },
-        {
-          l: "CAPACITY EXPANSION",
-          v: health.sufficient ? "NOT NEEDED" : `REQUIRED  (+${fmt(health.gapGB, 2)} GB)`,
-          c: health.sufficient ? sevColor.success : sevColor.danger,
-        },
-      ];
-      const dw = (W - 88 - 10) / 2;
-      decs.forEach((d, i) => {
-        const x = 44 + i * (dw + 10);
-        ctx.fillStyle = d.c + (isDark ? "14" : "0D");
-        rr(ctx, x, dY, dw, 62, 12);
-        ctx.fill();
-        ctx.strokeStyle = d.c + "44";
-        ctx.lineWidth = 1;
-        rr(ctx, x, dY, dw, 62, 12);
-        ctx.stroke();
-        ctx.fillStyle = C.t4;
-        ctx.font = 'bold 9.5px "Segoe UI", Arial, sans-serif';
-        ctx.fillText(d.l, x + 18, dY + 22);
-        ctx.fillStyle = d.c;
-        ctx.font = 'bold 17px "Segoe UI", Arial, sans-serif';
-        ctx.fillText(d.v, x + 18, dY + 46);
-      });
-
-      /* assumptions */
-      const aY = dY + 80;
-      ctx.fillStyle = C.card2;
-      rr(ctx, 44, aY, W - 88, 56, 12);
-      ctx.fill();
-      ctx.strokeStyle = C.border;
-      rr(ctx, 44, aY, W - 88, 56, 12);
-      ctx.stroke();
-      ctx.fillStyle = C.t4;
-      ctx.font = 'bold 9.5px "Segoe UI", Arial, sans-serif';
-      ctx.fillText("ASSUMPTIONS & POLICY BASIS", 60, aY + 20);
-      ctx.fillStyle = C.t3;
-      ctx.font = '11.5px "JetBrains Mono", Consolas, monospace';
-      ctx.fillText(
-        `(used + RAM${result.memSnap ? " ×2" : ""} + overhead) × ${fmt(parseFloat(buf) || POLICY.safetyBuffer, 2)} buffer   ·   overhead ${Math.round(POLICY.overheadPercent * 100)}% of capacity${overridden ? " (overridden)" : ""}   ·   thresholds ${POLICY.freeSpace.approvedPct}/${POLICY.freeSpace.warningPct}% free   ·   ${APP.formulaVersion}`,
-        60,
-        aY + 40
-      );
-
-      /* sign-off */
-      const soY = aY + 92;
-      const roles = ["Prepared by", "Reviewed by", "Approved by"];
-      const colW = (W - 88 - 60) / 3;
-      roles.forEach((r, i) => {
-        const x = 44 + i * (colW + 30);
-        ctx.strokeStyle = C.t4;
-        ctx.setLineDash([3, 4]);
-        ctx.beginPath();
-        ctx.moveTo(x, soY + 18);
-        ctx.lineTo(x + colW, soY + 18);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        ctx.fillStyle = C.t4;
-        ctx.font = 'bold 10px "Segoe UI", Arial, sans-serif';
-        ctx.fillText(r.toUpperCase(), x, soY + 38);
-        ctx.fillStyle = C.t4;
-        ctx.font = '10px "Segoe UI", Arial, sans-serif';
-        ctx.fillText("Name / Signature / Date", x, soY + 54);
-      });
-
-      /* footer */
-      const fY = H - 54;
-      ctx.fillStyle = C.card;
-      ctx.fillRect(0, fY, W, 54);
-      const fStrip = ctx.createLinearGradient(0, fY, W, fY);
-      fStrip.addColorStop(0, maroon);
-      fStrip.addColorStop(1, gold);
-      ctx.fillStyle = fStrip;
-      ctx.fillRect(0, fY, W, 3);
-      ctx.fillStyle = gold;
-      ctx.font = 'bold 12px "Segoe UI", Arial, sans-serif';
-      ctx.fillText(`${APP.orgLine1}  ·  ${APP.orgLine2}`, 44, fY + 33);
-      ctx.textAlign = "right";
-      ctx.fillStyle = C.t4;
-      ctx.font = '11px "JetBrains Mono", Consolas, monospace';
-      ctx.fillText(`${ref}  ·  ${APP.formulaVersion}`, W - 44, fY + 33);
-      ctx.textAlign = "left";
-
-      const link = document.createElement("a");
-      link.download = `${(dsName || "datastore").trim().replace(/\s+/g, "-") || "datastore"}-assessment-${ref}.png`;
-      link.href = canvas.toDataURL("image/png");
-      link.click();
-      toast.success(`Report ${ref} exported`);
+      const outcome = await parseWorkbookFile(file);
+      let inventory: RVInventory;
+      if (outcome.inventory) {
+        inventory = outcome.inventory;
+      } else {
+        inventory = {
+          datastores: outcome.rows
+            .filter((r) => r.datastore && r.capacityGB > 0)
+            .map((r) => ({
+              name: r.datastore, capacityGB: r.capacityGB, provisionedGB: r.provisionedGB ?? null,
+              freeGB: r.freeGB, usedGB: r.usedGB, cluster: r.cluster, naaLunId: r.naaLunId || undefined,
+            })),
+          vms: [],
+        };
+      }
+      if (inventory.datastores.length === 0) {
+        toast.error("No usable datastores found in that file.");
+        return;
+      }
+      setInventory("capacity", { inventory, fileName: file.name, source: outcome.source, loadedAt: Date.now() });
+      setAutoFilled(false);
+      setRvDs("");
+      toast.success(`${outcome.source === "rvtools" ? "RVTools" : "Template"} loaded — ${inventory.datastores.length} datastores found`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not parse that workbook.");
     } finally {
-      setExporting(false);
+      setBusy(false);
     }
   }
 
-  const units = result ? allUnits(result.required) : null;
+  function applyRVTools(name: string) {
+    setRvDs(name);
+    const ds = inv?.datastores.find((d) => d.name === name);
+    if (!ds) return;
+    const ramGB = inv!.vms
+      .filter((v) => v.disks.some((d) => d.datastore === name))
+      .reduce((s, v) => s + v.ramGB, 0);
+    const usedGB = ds.usedGB ?? +(ds.capacityGB - ds.freeGB).toFixed(2);
+    setDsName(ds.name);
+    setCluster(ds.cluster ?? "");
+    setNaaLunId(ds.naaLunId ?? "");
+    setDsCap(uv(num(ds.capacityGB, 2)));
+    setCurTot(uv(num(ds.capacityGB, 2)));
+    setCurFree(uv(num(ds.freeGB, 2)));
+    setUsed(uv(num(usedGB, 2)));
+    setRam(uv(num(ramGB, 2)));
+    /* explicit values from inventory → user-owned links stay released so the
+       10% reserve still tracks capacity edits afterwards */
+    setUsedManual(true);
+    setCurTotManual(false);
+    setSnapManual(false);
+    setAutoFilled(true);
+    toast.success(`${ds.name} applied — review and calculate`);
+  }
+
+  function clearAll() {
+    clearPersisted("cap.");
+    setMethod(DEFAULTS.method);
+    setDsName(DEFAULTS.dsName);
+    setCluster(DEFAULTS.cluster);
+    setNaaLunId(DEFAULTS.naaLunId);
+    setUsed(DEFAULTS.used); setRam(DEFAULTS.ram); setDsCap(DEFAULTS.dsCap);
+    setSnap(DEFAULTS.snap); setCurTot(DEFAULTS.curTot); setCurFree(DEFAULTS.curFree);
+    setBuf(DEFAULTS.buf); setMemSnap(DEFAULTS.memSnap);
+    setUsedManual(false); setCurTotManual(false); setSnapManual(false);
+    clearInventory("capacity"); setRvDs(""); setAutoFilled(false);
+    toast.success("Inputs cleared — saved values wiped for this tab");
+  }
+
+  async function exportPng() {
+    if (!live) return;
+    toast.loading("Rendering PNG report…", { id: "png" });
+    try {
+      const ref = await exportAssessmentPng({ ...live.echo, sizing: live.sizing, health: live.health });
+      toast.success(`Report ${ref} exported`, { id: "png" });
+    } catch {
+      toast.error("PNG export failed", { id: "png" });
+    }
+  }
+
+  /* link toggle helper */
+  function LinkChip({ manual, onToggle, what }: { manual: boolean; onToggle: () => void; what: string }) {
+    return (
+      <Tip
+        tip={manual ? `${what} is under manual control — click to release it back to automatic derivation.` : `${what} auto-derives from the linked inputs as they change. Type to override, or click to reapply the derivation now.`}
+        title={manual ? "Manual" : "Linked"}
+      >
+        <button
+          type="button"
+          onClick={onToggle}
+          className="inline-flex items-center font-num"
+          style={{
+            gap: 5, background: "none", border: "none", cursor: "pointer", padding: 0,
+            fontSize: 10.5, fontWeight: 800, letterSpacing: "0.6px",
+            color: manual ? "var(--gold)" : "var(--text-4)",
+          }}
+        >
+          {manual ? <Unlink2 size={10} /> : <Link2 size={10} />}
+          {manual ? "MANUAL" : "LINKED"}
+        </button>
+      </Tip>
+    );
+  }
+
+  /* ── render ── */
+  const h = live?.health;
+  const missing = pre.errors.slice(0, 3);
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 460px), 1fr))", gap: 22 }}>
-      {/* ════════ INPUT ════════ */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-        <Card title="Datastore Identity" sub="Carried onto every exported report" accent="var(--maroon)" delay={0}>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 14 }}>
-            <TextInput label="Datastore Name" value={dsName} onChange={setDsName} placeholder="DS-PROD-CLUS03-LUN07" icon={<Database size={13} />} />
-            <TextInput label="Cluster / vCenter" value={cluster} onChange={setCluster} placeholder="PROD-CLUSTER-03" icon={<Building2 size={13} />} />
-          </div>
-        </Card>
+    <div
+      className="mx-auto grid items-start"
+      style={{ maxWidth: 1500, padding: "24px 20px 8px", gap: 20, gridTemplateColumns: "repeat(auto-fit, minmax(420px, 1fr))" }}
+    >
+      {/* ── inputs ── */}
+      <Card
+        title="Capacity inputs"
+        right={<ClearButton onClick={clearAll} />}
+        sub={
+          method === "manual"
+            ? "Type the inventory figures — linked fields derive from each other until you override them. Everything documents itself on hover."
+            : "Drop an RVTools export, pick a datastore, and the sizing inputs fill themselves."
+        }
+      >
+        <Segmented
+          value={method}
+          onChange={setMethod}
+          options={[
+            { value: "manual", label: (<span className="inline-flex items-center" style={{ gap: 7 }}><Keyboard size={13} /> Manual entry</span>) },
+            { value: "rvtools", label: (<span className="inline-flex items-center" style={{ gap: 7 }}><FileSpreadsheet size={13} /> RVTools import</span>) },
+          ]}
+        />
 
-        <Card title="Datastore Used Space" sub="Total consumed storage across all VMs on this datastore" accent="var(--maroon)" delay={0.05}>
-          <Field
-            label="Total Used Space"
-            num="1"
-            hint="vCenter → Storage → Datastore → Summary → Used"
-            value={used.v}
-            onChange={(v) => {
-              setUsed({ v, u: used.u });
-              setFieldErrors({});
-            }}
-            unit={used.u}
-            onUnit={(u) => setUsed({ v: used.v, u })}
-            error={fieldErrors.used}
-          />
-        </Card>
-
-        <Card title="VM RAM — Swap Reservation" sub="Sum of configured RAM across the VMs on this datastore" accent="var(--blue)" delay={0.1}>
-          <Field
-            label="Total VM RAM"
-            num="2"
-            hint="vCenter → VMs → Edit Settings → Memory"
-            value={ram.v}
-            onChange={(v) => {
-              setRam({ v, u: ram.u });
-              setFieldErrors({});
-            }}
-            unit={ram.u}
-            onUnit={(u) => setRam({ v: ram.v, u })}
-            error={fieldErrors.ram}
-          />
-          <Toggle
-            checked={memSnap}
-            onChange={setMemSnap}
-            label="Memory-state snapshots"
-            sub={memSnap ? "RAM is counted twice — swap reservation plus memory state" : "Reserve additional space for .vmsn memory capture"}
-          />
-        </Card>
-
-        <Card title="Capacity & Snapshot Reserve" accent="var(--amber)" delay={0.15}>
-          <Field
-            label="Datastore Total Capacity"
-            num="3"
-            hint="vCenter → Datastore → Summary → Capacity"
-            value={dsCap.v}
-            onChange={(v) => setDsCap({ v, u: dsCap.u })}
-            unit={dsCap.u}
-            onUnit={(u) => setDsCap({ v: dsCap.v, u })}
-            error={fieldErrors.dsCap}
-          />
-          <Field
-            label="Snapshot Overhead"
-            num="4"
-            derived
-            derivedNote={`${Math.round(POLICY.overheadPercent * 100)}% policy`}
-            overridden={overridden}
-            onResetDerived={resetSnap}
-            value={snap.v}
-            onChange={editSnap}
-            unit={snap.u}
-            onUnit={(u) => setSnap({ v: snap.v, u })}
-            error={fieldErrors.snap}
-          />
-        </Card>
-
-        <Card title="Safety & Current State" sub="Buffer and live datastore metrics for the health assessment" accent="var(--gold)" delay={0.2}>
-          <Field
-            label="Safety Buffer"
-            num="5"
-            hint={`Policy default ${POLICY.safetyBuffer} — maintains ~20–25% free headroom`}
-            value={buf}
-            onChange={(v) => {
-              setBuf(v);
-              setFieldErrors({});
-            }}
-            showUnit={false}
-            suffix="× multiplier"
-            step="0.05"
-            error={fieldErrors.buf}
-          />
-          <div style={{ height: 1, margin: "14px 0 18px", background: "var(--border-1)" }} />
-          <Field
-            label="Current Capacity"
-            num="6"
-            optional
-            value={curTot.v}
-            onChange={(v) => setCurTot({ v, u: curTot.u })}
-            unit={curTot.u}
-            onUnit={(u) => setCurTot({ v: curTot.v, u })}
-            error={fieldErrors.curTot}
-          />
-          <Field
-            label="Current Free Space"
-            num="7"
-            optional
-            value={curFree.v}
-            onChange={(v) => setCurFree({ v, u: curFree.u })}
-            unit={curFree.u}
-            onUnit={(u) => setCurFree({ v: curFree.v, u })}
-            error={fieldErrors.curFree}
-          />
-
-          <AnimatePresence>
-            {preChecks.warnings.length > 0 && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }}
-                style={{ overflow: "hidden" }}
-              >
-                {preChecks.warnings.map((w, i) => (
-                  <motion.div
-                    key={i}
-                    initial={{ opacity: 0, x: -8 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{ delay: i * 0.04 }}
-                    className="flex items-start"
-                    style={{
-                      gap: 8,
-                      padding: "10px 14px",
-                      borderRadius: 10,
-                      marginBottom: 6,
-                      fontSize: 13,
-                      lineHeight: 1.6,
-                      fontWeight: 500,
-                      background: "var(--amber-bg)",
-                      color: "var(--amber)",
-                      border: "1px solid rgba(245,158,11,0.3)",
-                    }}
-                  >
-                    <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
-                    <span>{w}</span>
-                  </motion.div>
-                ))}
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {livePreview && (
-            <div
-              className="flex items-center justify-between"
-              style={{
-                padding: "13px 16px",
-                borderRadius: 12,
-                marginTop: 4,
-                marginBottom: 10,
-                background: "var(--maroon-bg)",
-                border: "1px solid var(--gold-border)",
-              }}
-            >
-              <span style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: "1.5px", textTransform: "uppercase", color: "var(--text-3)" }}>
-                Projected requirement
-              </span>
-              <span className="font-num shimmer-gold" style={{ fontSize: 20, fontWeight: 800 }}>
-                {livePreview} GB
-              </span>
-            </div>
-          )}
-
-          <CalcButton onClick={calculate} label="Calculate required capacity" />
-        </Card>
-      </div>
-
-      {/* ════════ RESULTS ════════ */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 18 }} aria-live="polite">
         <AnimatePresence mode="wait">
-          {!result ? (
-            <motion.div key="ph" exit={{ opacity: 0, scale: 0.96 }}>
-              <Card delay={0.1}>
-                <div style={{ textAlign: "center", padding: "72px 20px" }}>
-                  <motion.div animate={{ y: [0, -9, 0] }} transition={{ duration: 3.4, repeat: Infinity, ease: "easeInOut" }} style={{ opacity: 0.16, marginBottom: 18 }}>
-                    <Database size={54} style={{ margin: "0 auto", color: "var(--gold)" }} />
-                  </motion.div>
-                  <p style={{ fontSize: 16.5, fontWeight: 600, color: "var(--text-3)" }}>Awaiting calculation</p>
-                  <p style={{ fontSize: 13.5, color: "var(--text-4)", marginTop: 8 }}>Complete the inputs — results render here</p>
-                </div>
-              </Card>
-            </motion.div>
-          ) : (
-            <motion.div key="res" initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-              <Card title="Capacity Sizing Breakdown" sub="Formula: (Used + RAM + Overhead) × Safety Buffer" accent="var(--green)" delay={0}>
-                <Row label="Datastore Used" value={`${fmt(result.usedGB)} GB`} />
-                <Row
-                  label={result.memSnap ? "VM RAM (×2 — memory state)" : "VM RAM"}
-                  value={`${fmt(result.ramGB)} GB`}
-                  gold={result.memSnap}
-                  badge={result.memSnap ? <NotePill>originally {fmt(result.origRamGB)} GB</NotePill> : undefined}
+          {method === "rvtools" && (
+            <motion.div
+              key="rv"
+              initial={{ opacity: 0, height: 0, marginTop: 0 }}
+              animate={{ opacity: 1, height: "auto", marginTop: 14 }}
+              exit={{ opacity: 0, height: 0, marginTop: 0 }}
+              transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+              style={{ overflow: "hidden" }}
+            >
+              {!inv ? (
+                <FileDrop
+                  onFile={importWorkbook}
+                  busy={busy}
+                  compact
+                  label="Drop an RVTools export (.xlsx) — or the template"
+                  note="vDatastore is required; vMultiPath adds the NAA / LUN identifier, vInfo + vDisk add per-VM RAM."
                 />
-                <Row
-                  label="Snapshot Overhead"
-                  value={`${fmt(result.snapGB)} GB`}
-                  badge={<NotePill>{overridden ? "manual" : `${Math.round(POLICY.overheadPercent * 100)}% policy`}</NotePill>}
-                />
-                <Row label="Raw Sum" value={`${fmt(result.raw)} GB`} />
-                <Row label={`Safety Buffer (+${fmt(result.bufferPct, 0)}%)`} value={`+${fmt(result.padding)} GB`} />
-                <BigResult
-                  label="Required Datastore Capacity"
-                  value={`${fmt(result.required, 2)} GB`}
-                  sub={`${fmt(units!.TB, 4)} TB   ·   ${fmt(units!.MB, 0)} MB`}
-                />
-                <UnitsGrid units={units!} />
-                <div className="font-num" style={{ marginTop: 14, fontSize: 10.5, color: "var(--text-4)", letterSpacing: "0.4px" }}>
-                  {Math.round(POLICY.overheadPercent * 100)}% reserve · {fmt(parseFloat(buf) || POLICY.safetyBuffer, 2)}× buffer · {POLICY.freeSpace.approvedPct}/{POLICY.freeSpace.warningPct}% thresholds · {APP.formulaVersion}
-                </div>
-              </Card>
-
-              {health ? (
-                <Card
-                  title="Health Assessment"
-                  sub="Current and projected-peak evaluation against policy"
-                  accent={health.sev === "success" ? "var(--green)" : health.sev === "warning" ? "var(--amber)" : "var(--red)"}
-                  glow={health.sev === "danger" ? "rgba(239,68,68,0.05)" : health.sev === "warning" ? "rgba(245,158,11,0.04)" : "rgba(34,197,94,0.03)"}
-                  delay={0.08}
-                >
-                  <StatusPanel sev={health.sev} title={`STATUS: ${health.status}`} detail={health.msg} />
-
-                  <SectionLabel>
-                    <span style={{ marginTop: 18, display: "inline-block", marginBottom: 0 }}>Current utilization</span>
-                  </SectionLabel>
-                  <Progress
-                    pct={health.usedPct}
-                    sev={health.sev}
-                    markerPct={100 - POLICY.freeSpace.approvedPct}
-                    showMarkerLabel
-                    left={`Used: ${fmt(health.usedGB, 2)} GB (${health.usedPct}%)`}
-                    right={`Free: ${fmt(health.freeGB, 2)} GB (${health.freePct}%)`}
-                  />
-
-                  <SectionLabel>
-                    <span style={{ marginTop: 18, display: "inline-block", marginBottom: 0 }}>Projected free space at peak snapshot</span>
-                  </SectionLabel>
-                  <Progress
-                    pct={Math.max(health.projectedFreePct, 0)}
-                    sev={health.projectedFreePct >= POLICY.freeSpace.approvedPct ? "success" : health.projectedFreePct >= POLICY.freeSpace.warningPct ? "warning" : "danger"}
-                    markerPct={POLICY.freeSpace.approvedPct}
-                    showMarkerLabel
-                    left={`Projected: ${fmt(health.projectedFreeGB, 2)} GB (${health.projectedFreePct}%)`}
-                    right={`Demand: ${fmt(health.demandGB, 2)} GB`}
-                  />
-
-                  <div style={{ marginTop: 20 }}>
-                    <SectionLabel>Snapshot Authorization</SectionLabel>
-                    <StatusPanel
-                      sev={health.snapAuthorized ? "success" : "danger"}
-                      title={health.snapAuthorized ? `AUTHORIZED — projected ${health.projectedFreePct}% free at peak` : "DENIED — insufficient margin at peak"}
-                      detail={
-                        health.snapAuthorized
-                          ? health.breachAtPeak
-                            ? `Authorized now, but peak consumption drops free space below the ${POLICY.freeSpace.approvedPct}% policy line — schedule consolidation windows and monitor delta growth.`
-                            : `Free space holds above policy even at full overhead consumption. Proceed per change management.`
-                          : `Peak consumption would leave ${health.projectedFreePct}% free, below the ${POLICY.freeSpace.warningPct}% danger line. Expand capacity before snapshot operations.`
-                      }
-                    />
-                  </div>
-
-                  <div style={{ marginTop: 20 }}>
-                    <SectionLabel>Expansion Assessment</SectionLabel>
-                    {health.sufficient ? (
-                      <StatusPanel
-                        sev="success"
-                        title="NO EXPANSION NEEDED"
-                        detail={`Current capacity of ${fmt(health.totalGB, 2)} GB meets the requirement of ${fmt(result.required, 2)} GB.`}
-                      />
-                    ) : (
-                      <>
-                        <StatusPanel sev="danger" title="EXPANSION REQUIRED" />
-                        <BigResult danger label="Required Expansion" value={`+${fmt(health.gapGB, 2)} GB`} sub={`${fmt(health.gapGB / 1024, 4)} TB additional capacity needed`} />
-                      </>
-                    )}
-                  </div>
-
-                  <SummaryBox health={health} />
-
-                  <motion.button
-                    whileHover={{ scale: 1.015, y: -1 }}
-                    whileTap={{ scale: 0.98 }}
-                    onClick={exportReport}
-                    disabled={exporting}
-                    style={{
-                      width: "100%",
-                      padding: 15,
-                      borderRadius: 14,
-                      marginTop: 22,
-                      cursor: exporting ? "wait" : "pointer",
-                      border: "1.5px solid var(--gold-border)",
-                      fontSize: 14,
-                      fontWeight: 800,
-                      letterSpacing: "1px",
-                      background: "linear-gradient(135deg, var(--gold-bg), var(--maroon-bg))",
-                      color: "var(--gold)",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      gap: 10,
-                    }}
-                  >
-                    <FileDown size={17} />
-                    {exporting ? "GENERATING…" : "EXPORT ASSESSMENT REPORT"}
-                  </motion.button>
-
-                  <div className="flex items-center justify-between flex-wrap" style={{ marginTop: 14, gap: 8 }}>
-                    <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "1.2px", textTransform: "uppercase", color: "var(--gold)" }}>
-                      {APP.orgLine1}
-                    </span>
-                    <span className="font-num" style={{ fontSize: 10.5, color: "var(--text-4)" }}>
-                      {APP.classification}
-                    </span>
-                  </div>
-                </Card>
               ) : (
-                <Card delay={0.08}>
-                  <div className="flex items-start" style={{ gap: 12, padding: "6px 2px" }}>
-                    <Server size={18} style={{ color: "var(--text-4)", flexShrink: 0, marginTop: 2 }} />
-                    <p style={{ fontSize: 13.5, color: "var(--text-3)", lineHeight: 1.7 }}>
-                      Sizing complete. Enter <strong style={{ color: "var(--text-1)" }}>Current Capacity</strong> and{" "}
-                      <strong style={{ color: "var(--text-1)" }}>Current Free Space</strong> (fields 6 and 7) to unlock the
-                      health assessment and the exportable report.
-                    </p>
+                <div className="rounded-xl" style={{ padding: 14, background: "var(--bg-input)", border: "1px solid var(--border-1)" }}>
+                  <div className="flex items-center justify-between flex-wrap" style={{ gap: 8 }}>
+                    <div className="flex items-center font-num" style={{ gap: 8, fontSize: 12, color: "var(--text-1)", fontWeight: 700 }}>
+                      <FileSpreadsheet size={15} style={{ color: "var(--gold)" }} />
+                      {rvFile}
+                    </div>
+                    <div className="flex items-center" style={{ gap: 6 }}>
+                      {rvSource === "rvtools" && <Chip tone="gold" tip="RVTools parser build that read this file. Re-import after a parser upgrade so cached results are refreshed.">{RVTOOLS_PARSER_VERSION}</Chip>}
+                      <GhostButton label="Replace" onClick={() => { clearInventory("capacity"); setRvDs(""); setAutoFilled(false); }} />
+                    </div>
                   </div>
-                </Card>
+                  <div className="flex flex-wrap" style={{ gap: 6, marginTop: 10 }}>
+                    <Chip tip="Workbook rows that were successfully mapped to datastores.">{inv.datastores.length} datastores</Chip>
+                    <Chip tip="NAA / LUN identifiers captured from vMultiPath (the Disk column) or an identifier column. Flows into the Storage Team report.">
+                      {inv.datastores.filter((d) => d.naaLunId).length} LUN ids
+                    </Chip>
+                    <Chip tip="Virtual machines parsed from vDisk + vInfo — their RAM is summed per datastore.">{inv.vms.length} VMs</Chip>
+                  </div>
+                  <div style={{ marginTop: 12 }}>
+                    <FieldLabel tip="Choose the datastore to assess. Capacity, free space, used space and aggregate VM RAM are auto-filled (machine-safe numbers) and stay editable.">
+                      Datastore from inventory
+                    </FieldLabel>
+                    <select
+                      value={rvDs}
+                      onChange={(e) => e.target.value && applyRVTools(e.target.value)}
+                      className="font-num"
+                      style={{
+                        width: "100%", background: "var(--bg-2)", border: "1px solid var(--border-2)", borderRadius: 11,
+                        padding: "10px 12px", fontSize: 13, color: "var(--text-1)", cursor: "pointer", outline: "none",
+                      }}
+                      aria-label="Select datastore"
+                    >
+                      <option value="">— pick a datastore —</option>
+                      {inv.datastores.map((d) => (
+                        <option key={d.name} value={d.name}>
+                          {d.name} — {fmt(d.capacityGB, 1)} GB · {fmt(d.freeGB, 1)} free{d.naaLunId ? " · has LUN id" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
               )}
             </motion.div>
           )}
         </AnimatePresence>
-      </div>
-    </div>
-  );
-}
 
-/* ── local bits ─────────────────────────────────────────────── */
-
-function NotePill({ children }: { children: ReactNode }) {
-  return (
-    <span
-      className="font-num"
-      style={{
-        fontSize: 10,
-        fontWeight: 700,
-        padding: "2px 8px",
-        borderRadius: 6,
-        background: "var(--bg-3)",
-        border: "1px solid var(--border-1)",
-        color: "var(--text-4)",
-      }}
-    >
-      {children}
-    </span>
-  );
-}
-
-function SummaryBox({ health }: { health: HealthStatus }) {
-  const items = [
-    { l: "Status", v: health.status, s: health.sev },
-    { l: "Free Space", v: `${health.freePct}%`, s: health.sev },
-    { l: "Peak Free", v: `${health.projectedFreePct}%`, s: health.projectedFreePct >= 25 ? ("success" as Severity) : health.projectedFreePct >= 15 ? ("warning" as Severity) : ("danger" as Severity) },
-    { l: "Snapshot", v: health.snapAuthorized ? "Authorized" : "Denied", s: health.snapAuthorized ? ("success" as Severity) : ("danger" as Severity) },
-    { l: "Expansion", v: health.sufficient ? "Not needed" : `+${fmt(health.gapGB, 2)} GB`, s: health.sufficient ? ("success" as Severity) : ("danger" as Severity) },
-  ];
-  const c: Record<Severity, string> = { success: "var(--green)", warning: "var(--amber)", danger: "var(--red)" };
-  return (
-    <div style={{ marginTop: 22, padding: 18, borderRadius: 14, background: "var(--bg-input)", border: "1px solid var(--border-1)" }}>
-      <div style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: "2px", textTransform: "uppercase", color: "var(--gold)", marginBottom: 12 }}>
-        Cross-Team Summary
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(108px, 1fr))", gap: 10 }}>
-        {items.map((it) => (
-          <div key={it.l} style={{ padding: 12, borderRadius: 10, background: "var(--bg-card)", border: "1px solid var(--border-1)" }}>
-            <div style={{ fontSize: 9.5, fontWeight: 800, letterSpacing: "1px", textTransform: "uppercase", color: "var(--text-4)", marginBottom: 4 }}>{it.l}</div>
-            <div style={{ fontSize: 14.5, fontWeight: 800, color: c[it.s] }}>{it.v}</div>
+        {autoFilled && (
+          <div style={{ marginTop: 12 }}>
+            <Chip tone="success" tip="These values came from the imported workbook. They remain fully editable — adjust anything and watch the results update live.">
+              <ShieldCheck size={11} /> Auto-filled from inventory — editable
+            </Chip>
           </div>
-        ))}
-      </div>
-    </div>
-  );
-}
+        )}
 
-function TextInput({ label, value, onChange, placeholder, icon }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string; icon?: ReactNode }) {
-  return (
-    <div>
-      <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "1.4px", textTransform: "uppercase", color: "var(--text-4)", marginBottom: 8 }}>{label}</div>
-      <div style={{ position: "relative" }}>
-        {icon && <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", color: "var(--text-4)" }}>{icon}</span>}
-        <input
-          type="text"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-          aria-label={label}
-          className="font-num"
-          style={{
-            width: "100%",
-            padding: icon ? "12px 14px 12px 36px" : "12px 14px",
-            borderRadius: 12,
-            fontSize: 14,
-            fontWeight: 600,
-            outline: "none",
-            background: "var(--bg-input)",
-            border: "1.5px solid var(--border-2)",
-            color: "var(--text-0)",
-            transition: "border-color .25s",
-          }}
-          onFocus={(e) => (e.currentTarget.style.borderColor = "var(--maroon)")}
-          onBlur={(e) => (e.currentTarget.style.borderColor = "var(--border-2)")}
+        <SectionLabel>Identity</SectionLabel>
+        <TextField
+          label="Datastore name" value={dsName} onChange={setDsName} placeholder="DS-PROD-01"
+          tip="Datastore name exactly as it appears in vCenter. Echoed onto the exported report's identity block."
         />
+        <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+          <TextField
+            label="Cluster (optional)" value={cluster} onChange={setCluster} placeholder="POD-PROD"
+            tip="Datastore cluster / Storage Pod. Optional context, echoed onto the report for the Storage Team."
+          />
+          <TextField
+            label="NAA / LUN ID (optional)" value={naaLunId} onChange={setNaaLunId} placeholder="naa.6000… / LUN 12"
+            tip="SCSI identifier of the backing LUN (NAA canonical name naa.…/eui.…, serial, or UUID). Optional but recommended: it lands on the report so expansion actions target the exact device. Auto-filled from RVTools vMultiPath when present."
+          />
+        </div>
+
+        <SectionLabel>Sizing inputs</SectionLabel>
+        <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <div>
+            <div className="flex items-center justify-between" style={{ marginBottom: 2 }}>
+              <span style={{ flex: 1 }} />{/* keeps label row alignment via NumField's own label */}
+            </div>
+            <NumField
+              label="Used space" value={used} onChange={(v) => { setUsedManual(true); setUsed(v); }} invalid={invalid("used")}
+              tip="Currently consumed capacity (all VMDKs, ISOs, swap). Linked mode: derived as Current total − Current free until you type here. Required — it anchors the sizing sum."
+              hint={<LinkChip manual={usedManual} onToggle={() => { if (usedManual) { setUsedManual(false); if (curTotGB > 0 && curFree.v !== "" && curFreeGB <= curTotGB) setUsed(uv(num(curTotGB - curFreeGB, 2))); } }} what="Used space" />}
+            />
+          </div>
+          <NumField
+            label="Aggregate VM RAM" value={ram} onChange={setRam} invalid={invalid("ram")}
+            tip="Sum of RAM across VMs homed on this datastore. Reserved during sizing so memory-state snapshots (.vmsn) fit — the value doubles when the memory-snapshot toggle below is on."
+          />
+          <NumField
+            label="Datastore capacity" value={dsCap} onChange={setDsCap} invalid={invalid("dsCap")}
+            tip="Total provisioned capacity. Required — the policy overhead reserve (10%) derives from it, and Current total links to it. Drives the whole sizing model."
+            hint={
+              <>
+                Policy reserve:{" "}
+                <button
+                  type="button" className="tip-anchor font-num"
+                  style={{ background: "none", border: "none", cursor: "help", color: "var(--gold)", fontSize: 11, padding: 0 }}
+                  onClick={() => { setSnapManual(false); setSnap(uv(num(derivedReserveGB, 2))); }}
+                >
+                  10% → {fmt(derivedReserveGB)} GB — click to apply
+                </button>
+              </>
+            }
+          />
+          <NumField
+            label="Snapshot overhead reserve" value={snap} onChange={(v) => { setSnapManual(true); setSnap(v); }}
+            tip="Space reserved for snapshot growth. Linked mode: always 10% of Datastore capacity (policy). Override for change-heavy datastores — overrides are tracked on the report. Also feeds the peak-demand health estimate."
+            hint={<LinkChip manual={snapManual} onToggle={() => { if (snapManual) { setSnapManual(false); setSnap(uv(num(dsCapGB * POLICY.overheadPercent, 2))); } }} what="Overhead reserve" />}
+          />
+        </div>
+        {overheadOverridden && (
+          <div style={{ marginTop: 10 }}>
+            <Chip tone="gold" tip="The reserve differs from the 10% policy default. The override is explicitly recorded in the exported report.">
+              Policy override: reserve ≠ 10% — tracked in report
+            </Chip>
+          </div>
+        )}
+
+        <div style={{ marginTop: 12 }}>
+          <Toggle
+            checked={memSnap} onChange={setMemSnap}
+            label={
+              <Tip tip="When enabled, the sizing reserves twice the aggregate RAM (snapshot .vmsn files plus consolidation headroom). Memory-state snapshots capture live RAM and cost the most space." title="Memory-state snapshots">
+                Include memory-state snapshots <InfoDot />
+              </Tip>
+            }
+            sub="Effective RAM = 2 × aggregate VM RAM in the sizing sum."
+          />
+        </div>
+
+        <SectionLabel>Current state · health governance</SectionLabel>
+        <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <NumField
+            label="Current total capacity" value={curTot} onChange={(v) => { setCurTotManual(true); setCurTot(v); }} invalid={invalid("curTot")}
+            tip="The datastore's capacity today. Linked mode: follows Datastore capacity until you override it (e.g. modeling an already-approved expansion). Drives the free-space health model."
+            hint={<LinkChip manual={curTotManual} onToggle={() => { if (curTotManual) { setCurTotManual(false); setCurTot({ v: num(dsCapGB, 2), u: dsCap.u }); } }} what="Current total" />}
+          />
+          <NumField
+            label="Current free space" value={curFree} onChange={setCurFree} invalid={invalid("curFree")}
+            tip={`Free space right now. Approved line: ≥ ${POLICY.freeSpace.approvedPct}% of capacity. Below ${POLICY.freeSpace.warningPct}% snapshots are denied outright. Editing it (in linked mode) also refreshes Used space.`}
+          />
+        </div>
+        <div style={{ marginTop: 12 }}>
+          <FieldLabel tip={`Safety buffer multiplier on the raw sizing sum — policy default ${POLICY.safetyBuffer}× to hold ~20–25% operational headroom. Values above ${POLICY.bufferWarningAbove}× raise a plausibility warning.`}>
+            Safety buffer <InfoDot />
+          </FieldLabel>
+          <div className="flex items-center" style={{ gap: 8 }}>
+            {[1.15, 1.25, 1.5].map((b) => (
+              <button
+                key={b}
+                type="button"
+                onClick={() => setBuf(String(b))}
+                className="font-num"
+                style={{
+                  padding: "8px 13px", borderRadius: 10, cursor: "pointer", fontSize: 12, fontWeight: 800,
+                  color: buf === String(b) ? "#f3dd9a" : "var(--text-3)",
+                  background: buf === String(b) ? "var(--maroon)" : "var(--bg-input)",
+                  border: `1px solid ${buf === String(b) ? "var(--gold-border)" : "var(--border-2)"}`,
+                }}
+              >
+                {b}×
+              </button>
+            ))}
+            <input
+              type="number" step="0.05" min={1} value={buf} onChange={(e) => setBuf(e.target.value)}
+              className="font-num" aria-label="Custom buffer"
+              style={{
+                width: 90, background: "var(--bg-input)", border: `1px solid ${invalid("buf") ? "var(--red)" : "var(--border-2)"}`,
+                borderRadius: 10, padding: "8px 10px", fontSize: 12.5, color: "var(--text-1)", outline: "none",
+              }}
+            />
+          </div>
+        </div>
+
+        {anyValue && pre.errors.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            {pre.errors.slice(0, 4).map((e, i) => (
+              <div key={i} className="flex items-center" style={{ gap: 7, fontSize: 12, color: "var(--red)", padding: "3px 0" }}>
+                <CircleX size={13} style={{ flexShrink: 0 }} /> {e.msg}
+              </div>
+            ))}
+          </div>
+        )}
+        {pre.warnings.length > 0 && anyValue && (
+          <div style={{ marginTop: 14 }}>
+            <InfoBanner sev="warning" title="Plausibility warnings">
+              <ul style={{ margin: 0, paddingLeft: 16 }}>
+                {pre.warnings.slice(0, 4).map((w, i) => (
+                  <li key={i} style={{ fontSize: 12, lineHeight: 1.55 }}>{w}</li>
+                ))}
+              </ul>
+              {pre.warnings.length > 4 && <div style={{ fontSize: 11, marginTop: 4 }}>…and {pre.warnings.length - 4} more</div>}
+            </InfoBanner>
+          </div>
+        )}
+      </Card>
+
+      {/* ── results (live) ── */}
+      <div className="flex flex-col" style={{ gap: 16 }}>
+        {!live ? (
+          <Card className="min-h-[420px]">
+            <EmptyState
+              icon={<Gauge size={28} strokeWidth={1.7} />}
+              title="Assessment output appears here — live"
+              body={`Fill the sizing inputs (or import an RVTools export and pick a datastore). Results recompute with every keystroke: required capacity, the free-space governance verdict (policy lines ${POLICY.freeSpace.approvedPct}% / ${POLICY.freeSpace.warningPct}%), and a PNG report for the change record.`}
+            >
+              {missing.length > 0 && anyValue ? (
+                <div className="text-left rounded-xl" style={{ padding: "10px 16px", background: "var(--bg-input)", border: "1px solid var(--border-1)" }}>
+                  <div style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: "1px", color: "var(--text-4)", marginBottom: 6 }}>TO COMPLETE</div>
+                  {missing.map((e, i) => (
+                    <div key={i} className="flex items-center" style={{ gap: 7, fontSize: 12, color: "var(--text-3)", padding: "2px 0" }}>
+                      <CircleX size={12} style={{ color: "var(--amber)", flexShrink: 0 }} /> {e.msg}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <Chip tone="gold">2 input methods · linked fields · hover any label for documentation</Chip>
+              )}
+            </EmptyState>
+          </Card>
+        ) : (
+          <>
+            {/* verdict banner */}
+            <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
+              <InfoBanner
+                sev={h?.sev ?? "warning"}
+                title={
+                  <span className="flex items-center flex-wrap" style={{ gap: 10 }}>
+                    Health verdict: {h?.status ?? "NOT ASSESSED"}
+                    {h && (
+                      <StatusPill sev={h.snapAuthorized ? "success" : "danger"}>
+                        {h.snapAuthorized ? <ShieldCheck size={11} /> : <ShieldX size={11} />}
+                        &nbsp;Snapshots {h.snapAuthorized ? "AUTHORIZED" : "DENIED"}
+                      </StatusPill>
+                    )}
+                  </span>
+                }
+              >
+                {h?.msg}
+                {live.echo.datastoreName && (
+                  <span className="font-num" style={{ display: "block", marginTop: 6, fontSize: 11.5, color: "var(--text-3)" }}>
+                    {live.echo.datastoreName}
+                    {live.echo.cluster ? ` · ${live.echo.cluster}` : ""}
+                    {live.echo.naaLunId ? ` · ${live.echo.naaLunId}` : ""} · {live.echo.source === "rvtools" ? "RVTools import" : "manual entry"}
+                  </span>
+                )}
+              </InfoBanner>
+            </motion.div>
+
+            {/* sizing result */}
+            <Card
+              title="Sizing result"
+              right={
+                <div className="flex items-center" style={{ gap: 8 }}>
+                  <LiveBadge />
+                  <GhostButton
+                    onClick={exportPng}
+                    icon={<ImageDown size={14} />}
+                    label="Export PNG report"
+                    title="Theme-aware PNG with reference ID, inputs echo, assumptions and sign-off block — attach it to the change ticket"
+                  />
+                </div>
+              }
+            >
+              <div className="flex items-end flex-wrap" style={{ gap: 18 }}>
+                <div>
+                  <div style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: "1.2px", textTransform: "uppercase", color: "var(--text-4)" }}>
+                    <Tip tip="Required datastore capacity = (Used + effective RAM + overhead reserve) × safety buffer. The size this datastore should be to host the workload and its snapshots within policy." title="Required capacity">
+                      Required capacity <InfoDot />
+                    </Tip>
+                  </div>
+                  <div className="font-num" style={{ fontSize: 44, fontWeight: 800, letterSpacing: "-1px", color: "var(--gold)", lineHeight: 1.05, marginTop: 6 }}>
+                    <AnimatedValue value={live.sizing.required} format={(n) => smartUnit(n)} />
+                  </div>
+                </div>
+                <div className="flex flex-wrap" style={{ gap: 6, maxWidth: 430, marginLeft: "auto" }}>
+                  {UNITS.map((u) => (
+                    <Chip key={u} tip={`Required capacity expressed in ${u}.`}>
+                      {u}: {fmt(allUnits(live.sizing.required)[u], u === "PB" || u === "KB" ? 1 : 2)}
+                    </Chip>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ marginTop: 16 }}>
+                <ResultRow label="Used space" tip="Consumed capacity reported on this datastore." value={`${fmt(live.echo.usedGB)} GB`} />
+                <ResultRow
+                  label="Effective RAM" value={`${fmt(live.sizing.ramGB)} GB`}
+                  tip={live.sizing.memSnap ? `Aggregate RAM ${fmt(live.sizing.origRamGB)} GB doubled — memory-state snapshots capture live RAM.` : "Aggregate VM RAM (memory-state snapshots not included)."}
+                />
+                <ResultRow label="Overhead reserve" tip="Snapshot overhead reserve applied to the sizing sum (10% of capacity policy default; overrides tracked)." value={`${fmt(live.sizing.snapGB)} GB`} />
+                <ResultRow label="Raw sum" tip="Used + effective RAM + reserve — before the safety buffer." value={`${fmt(live.sizing.raw)} GB`} />
+                <ResultRow label="Buffer padding" tip={`Headroom added by the ${live.echo.buffer}× safety buffer (+${live.sizing.bufferPct.toFixed(0)}%).`} value={`+${fmt(live.sizing.padding)} GB`} />
+                <ResultRow label="Required capacity" tip="Raw sum × safety buffer." strong tone="gold" value={smartUnit(live.sizing.required)} />
+              </div>
+            </Card>
+
+            {/* health */}
+            {h && (
+              <Card title="Health & governance">
+                <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 20 }}>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-2)" }}>
+                      <Tip tip={`Free space today, as a percentage of capacity. Approved line ${POLICY.freeSpace.approvedPct}%: at or above it, snapshot operations are within policy.`} title="Current free space">
+                        Current free space <InfoDot />
+                      </Tip>
+                    </div>
+                    <Meter
+                      pct={h.freePct} sev={h.sev} markerPct={POLICY.freeSpace.approvedPct}
+                      left={`${fmt(h.freePct)}% · ${fmt(h.freeGB)} GB free`} right={`capacity ${fmt(h.totalGB)} GB`}
+                    />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-2)" }}>
+                      <Tip tip={`Free space remaining at snapshot peak = (Free − Demand) ÷ capacity. Demand on this tab is the ${fmt(live.sizing.snapGB)} GB overhead reserve. Snapshots stay authorized only while this holds ≥ ${POLICY.freeSpace.warningPct}%.`} title="Projected free at peak">
+                        Projected free at peak <InfoDot />
+                      </Tip>
+                    </div>
+                    <Meter
+                      pct={Math.max(h.projectedFreePct, 0)}
+                      sev={h.projectedFreePct >= POLICY.freeSpace.approvedPct ? "success" : h.projectedFreePct >= POLICY.freeSpace.warningPct ? "warning" : "danger"}
+                      markerPct={POLICY.freeSpace.warningPct}
+                      left={`${fmt(h.projectedFreePct)}% after ${fmt(live.sizing.snapGB)} GB demand`}
+                      right={h.breachAtPeak ? "policy breach at peak" : "held at peak"}
+                    />
+                  </div>
+                </div>
+
+                {h.breachAtPeak && (
+                  <div style={{ marginTop: 16 }}>
+                    <InfoBanner sev="warning" title="Passes today — breaches at peak">
+                      Free space is above {POLICY.freeSpace.approvedPct}% now, but the projected snapshot demand would drag it below the policy
+                      line. Schedule consolidation windows or expand capacity before snapshot storms.
+                    </InfoBanner>
+                  </div>
+                )}
+                {!h.sufficient && (
+                  <div style={{ marginTop: 16 }}>
+                    <InfoBanner sev="danger" title={`Expansion required: +${Math.ceil(h.gapGB).toLocaleString("en-US")} GB`}>
+                      Current capacity {smartUnit(h.totalGB)} is below the required {smartUnit(live.sizing.required)}. Request an expansion of at
+                      least {Math.ceil(h.gapGB).toLocaleString("en-US")} GB{live.echo.naaLunId ? ` against LUN ${live.echo.naaLunId}` : ""} to bring this datastore into policy.
+                    </InfoBanner>
+                  </div>
+                )}
+                {h.sufficient && !h.breachAtPeak && (
+                  <div style={{ marginTop: 16 }}>
+                    <InfoBanner sev="success" title="Ready — within policy">
+                      Capacity covers the required sizing with {fmt((h.totalGB - live.sizing.required) / 1024, 2)} TB of margin, and peak snapshot
+                      demand stays above the governance floor.
+                    </InfoBanner>
+                  </div>
+                )}
+
+                <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid var(--border-1)" }} className="flex flex-wrap items-center" >
+                  <span style={{ fontSize: 10.5, color: "var(--text-4)", letterSpacing: "0.6px" }} className="font-num">
+                    {APP.formulaVersion} · buffer {live.echo.buffer}× · thresholds {POLICY.freeSpace.approvedPct}/{POLICY.freeSpace.warningPct}% free · {APP.classification}
+                  </span>
+                </div>
+              </Card>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
-}
-
-/* ── canvas helpers ─────────────────────────────────────────── */
-
-function rr(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
-}
-
-function wt(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number) {
-  const words = text.split(" ");
-  let line = "";
-  for (let i = 0; i < words.length; i++) {
-    const test = line + words[i] + " ";
-    if (ctx.measureText(test).width > maxWidth && i > 0) {
-      ctx.fillText(line, x, y);
-      line = words[i] + " ";
-      y += lineHeight;
-    } else {
-      line = test;
-    }
-  }
-  ctx.fillText(line, x, y);
-}
-
-function chip(ctx: CanvasRenderingContext2D, x: number, y: number, label: string, value: string, C: Record<string, string>, gold: string) {
-  const w = 400;
-  const h = 44;
-  ctx.fillStyle = C.card2;
-  rr(ctx, x, y, w, h, 10);
-  ctx.fill();
-  ctx.strokeStyle = C.border;
-  ctx.lineWidth = 1;
-  rr(ctx, x, y, w, h, 10);
-  ctx.stroke();
-  ctx.fillStyle = C.t4;
-  ctx.font = 'bold 9px "Segoe UI", Arial, sans-serif';
-  ctx.fillText(label, x + 14, y + 17);
-  ctx.fillStyle = gold;
-  ctx.font = 'bold 13.5px "JetBrains Mono", Consolas, monospace';
-  ctx.fillText(value.slice(0, 38), x + 14, y + 35);
-}
-
-function bar(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, pct: number, color: string, track: string) {
-  ctx.fillStyle = track;
-  rr(ctx, x, y, w, h, h / 2);
-  ctx.fill();
-  const fw = Math.max(0, Math.min(pct, 100)) / 100;
-  if (fw > 0) {
-    const g = ctx.createLinearGradient(x, 0, x + w * fw, 0);
-    g.addColorStop(0, color + "BB");
-    g.addColorStop(1, color);
-    ctx.fillStyle = g;
-    rr(ctx, x, y, Math.max(w * fw, h), h, h / 2);
-    ctx.fill();
-  }
-}
-
-function marker(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, pct: number, color: string) {
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(x + (w * pct) / 100, y - 4);
-  ctx.lineTo(x + (w * pct) / 100, y + h + 4);
-  ctx.stroke();
 }

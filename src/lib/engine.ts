@@ -56,6 +56,16 @@ export function smartUnit(gb: number): string {
   return fmt(gb * K * K, 0) + " KB";
 }
 
+/** Rounds and returns a machine-safe numeric string ("17367.8", never
+ *  "17,367.8"). Feeding fmt() output into <input type="number"> is a bug —
+ *  locale commas make the field invalid and silently truncate the value.
+ *  Use num() whenever a computed number lands back in an input. */
+export function num(n: number, d = 2): string {
+  if (isNaN(n)) return "";
+  const r = +n.toFixed(d);
+  return Object.is(r, -0) ? "0" : String(r);
+}
+
 /* ── Datastore sizing ──────────────────────────────────────── */
 
 export interface DatastoreResult {

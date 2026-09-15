@@ -186,6 +186,9 @@ export interface RunbookMeta {
   projectedFreePct: number;
   authorized: boolean;
   status: string;
+  /** Rounded-up capacity to add, and what drove it (sizing vs peak floor). */
+  expansionGB?: number;
+  expansionDriver?: "none" | "sizing" | "peak";
 }
 
 export async function exportPlannerRunbook(
@@ -209,12 +212,23 @@ export async function exportPlannerRunbook(
     ["Capacity / Free", `${fmt(meta.capacityGB, 2)} GB / ${fmt(meta.freeGB, 2)} GB`],
     ["Planning mode", meta.mode === "worst" ? "Worst case — all VMs snapshot together" : `Staggered — max ${meta.maxConcurrent} concurrent`],
     ["VMs in scope", String(vms.length)],
+    ["Retention windows", (() => {
+      const uniq = Array.from(new Set(vms.map((v) => v.retentionDays))).sort((a, b) => a - b);
+      return uniq.length === 1 ? `${uniq[0]} day(s) — uniform` : `${uniq.join(" / ")} days — mixed per VM`;
+    })()],
     ["Aggregate daily write", `${fmt(meta.stats.dailyTotalGB, 3)} GB/day`],
+    ["Memory state captured", `${vms.filter((v) => v.memSnap).length} of ${vms.length} VMs`],
     ["Memory-state total", `${fmt(meta.stats.memTotalGB, 2)} GB`],
     ["Peak snapshot demand", `${fmt(meta.stats ? metaPeak(meta, windows) : 0, 2)} GB`],
     ["Used + RAM + Peak × buffer", `(${fmt(meta.stats.usedGB, 2)} + ${fmt(meta.stats.ramTotalGB, 2)} + ${fmt(metaPeak(meta, windows), 2)}) × ${meta.buffer}`],
     ["Required datastore capacity", `${fmt(meta.stats.requiredGB, 2)} GB`],
     ["Projected free at peak", `${fmt(meta.projectedFreePct, 2)}%`],
+    [
+      "REQUIRED INCREASE",
+      (meta.expansionGB ?? 0) > 0
+        ? `+${Math.ceil(meta.expansionGB!).toLocaleString("en-US")} GB  (driver: ${meta.expansionDriver === "peak" ? `snapshot peak vs ${POLICY.freeSpace.warningPct}% floor` : "required sizing"})`
+        : "0 GB — no expansion required",
+    ],
     ["Verdict", `${meta.status} — snapshots ${meta.authorized ? "AUTHORIZED" : "DENIED"}`],
     ["", ""],
     ["Formula basis", `${APP.formulaVersion} · safety factor ${POLICY.snapshotSafetyFactor} · buffer ${meta.buffer}`],

@@ -44,9 +44,12 @@ export const POLICY = {
 
 export const APP = {
   name: "VCapacity",
-  version: "2.1.1",
+  version: "2.0",
   /** Bumped whenever any formula or policy value changes. Printed on
-   *  every exported report so results stay auditable over time. */
+   *  every exported report so results stay auditable over time.
+   *  (v2.0 adds NAA/LUN reporting, the hover knowledge layer, the
+   *  Capacity-tab RVTools import and the planner's required-increase
+   *  model — the underlying formulas are unchanged.) */
   formulaVersion: "VC-FML-2026.1",
   orgLine1: "QNB · Technology Operations",
   orgLine2: "Cloud & Platform Services",

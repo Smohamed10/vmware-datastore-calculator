@@ -3,6 +3,8 @@
  * (vDatastore / vInfo / vDisk with the headers RVTools actually emits),
  * round-trips it through a real .xlsx buffer, and verifies the whole
  * ingestion path end to end.
+ *
+ * RVT-2026.3 adds a vMultiPath sheet so NAA/LUN capture is covered too.
  */
 import { describe, expect, it } from "vitest";
 import ExcelJS from "exceljs";
@@ -19,6 +21,18 @@ async function buildRVToolsWorkbook(): Promise<ExcelJS.Workbook> {
   ]);
   vds.addRow(["DS-PROD-01", "green", "VMFS", 2097152, 1572864, 1048064, 1049088, 50.027, "POD-PROD"]);
   vds.addRow(["DS-PROD-02", "green", "NFS", "1,048,576", 786432, 524288, 524288, 50, "POD-PROD"]);
+
+  const vmp = wb.addWorksheet("vMultiPath");
+  // The headers a real RVTools export emits — Disk carries the canonical
+  // naa name, Datastore links the row, Serial # / UUID are fallbacks.
+  vmp.addRow([
+    "Host", "Cluster", "Datacenter", "Datastore", "Disk", "Display name", "Policy",
+    "Oper. State", "Path 1", "Path 1 state", "Path 2", "Path 2 state", "Queue depth",
+    "Vendor", "Model", "Revision", "Level", "Serial #", "UUID", "Object ID", "VI SDK Server",
+  ]);
+  vmp.addRow(["esxi-01.local", "CL-PROD", "DC-01", "DS-PROD-01", "naa.6000abc1234567890abcdef000000001", "DS-PROD-01", "VMW_PSP_RR", "Active", "san.fc.0", "Active", "san.fc.1", "Active", 128, "PURE", "FlashArray", 1, 0, "ABC123001", "uuid-001", "naa.6000abc1234567890abcdef000000001", "vcenter.local"]);
+  vmp.addRow(["esxi-02.local", "CL-PROD", "DC-01", "DS-PROD-01", "naa.6000abc1234567890abcdef000000001", "DS-PROD-01", "VMW_PSP_RR", "Active", "san.fc.0", "Active", "san.fc.1", "Active", 128, "PURE", "FlashArray", 1, 0, "ABC123001", "uuid-001", "naa.6000abc1234567890abcdef000000001", "vcenter.local"]);
+  vmp.addRow(["esxi-01.local", "CL-PROD", "DC-01", "DS-PROD-02", "naa.6000abc1234567890abcdef0000000ff", "DS-PROD-02", "VMW_PSP_FIXED", "Active", "san.fc.2", "Active", "", "", 64, "DELLSC", "SC5020", 1, 0, "XYZ999002", "uuid-002", "naa.6000abc1234567890abcdef0000000ff", "vcenter.local"]);
 
   const vi = wb.addWorksheet("vInfo");
   vi.addRow(["VM", "Powerstate", "Template", "CPUs", "Memory", "Provisioned MiB", "In Use MiB"]);
@@ -57,10 +71,23 @@ describe("RVTools ingestion (realistic export shape)", () => {
     const ds1 = inv.datastores.find((d) => d.name === "DS-PROD-01")!;
     const ds2 = inv.datastores.find((d) => d.name === "DS-PROD-02")!;
     expect(ds1.capacityGB).toBe(2048);
+    expect(ds1.provisionedGB).toBe(1536);
     expect(ds1.freeGB).toBe(1024.5);
     expect(ds1.usedGB).toBe(1023.5);
     expect(ds1.cluster).toBe("POD-PROD");
     expect(ds2.capacityGB).toBe(1024); // "1,048,576" MiB string with comma
+  });
+
+  it("captures NAA identifiers from real-world vMultiPath (Disk + Datastore)", async () => {
+    const inv = parseRVInventory(await roundTrip(await buildRVToolsWorkbook()));
+    const ds1 = inv.datastores.find((d) => d.name === "DS-PROD-01")!;
+    const ds2 = inv.datastores.find((d) => d.name === "DS-PROD-02")!;
+    expect(ds1.naaLunId).toBe("naa.6000abc1234567890abcdef000000001");
+    expect(ds2.naaLunId).toBe("naa.6000abc1234567890abcdef0000000ff");
+    expect(inv.diagnostics?.lunIdsMapped).toBe(2);
+    // …and the id flows into the bulk rows that feed the Storage Team report
+    const rows = inventoryToRows(inv);
+    expect(rows.find((r) => r.datastore === "DS-PROD-01")!.naaLunId).toContain("naa.");
   });
 
   it("maps vInfo memory (MiB → GB) and vDisk capacity per datastore", async () => {

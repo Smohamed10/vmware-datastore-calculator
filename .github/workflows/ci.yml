@@ -24,7 +24,7 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Dependency vulnerability audit (production deps)
-        run: npm audit --omit=dev --audit-level=high
+        run: npm audit --omit=dev --audit-level=moderate
 
       - name: Unit tests (calculation engine)
         run: npx vitest run

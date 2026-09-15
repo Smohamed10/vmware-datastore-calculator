@@ -3,6 +3,10 @@
 #  VCapacity — bank-grade rootless container build
 #  Multi-stage: UBI Node build → UBI nginx (unprivileged, :8080)
 #  Alternative non-UBI runtime: nginxinc/nginx-unprivileged:alpine
+#
+#  Scan-note: for enterprise promotion, pin both base images by
+#  digest (FROM <image>@sha256:<digest>) after the build is
+#  proven, so Quay/Clair findings map to an immutable layer set.
 # ─────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ──────────────────────────────────────────

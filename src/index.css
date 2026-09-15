@@ -43,6 +43,12 @@
   --page-bg: radial-gradient(1200px 800px at 85% -10%, rgba(122, 27, 55, 0.16), transparent 60%),
     radial-gradient(900px 700px at -10% 110%, rgba(201, 168, 76, 0.08), transparent 55%), var(--bg-0);
   --scrollbar-thumb: #263050;
+
+  /* ambient backdrop tuning (dark) */
+  --grid-line: rgba(148, 163, 205, 0.06);
+  --mote-cool: rgba(201, 168, 76, 0.85);
+  --scan-tint: rgba(122, 27, 55, 0.10);
+  --scan-tint-gold: rgba(201, 168, 76, 0.06);
   color-scheme: dark;
 }
 
@@ -85,6 +91,12 @@
   --page-bg: radial-gradient(1200px 800px at 85% -10%, rgba(109, 25, 50, 0.08), transparent 60%),
     radial-gradient(900px 700px at -10% 110%, rgba(201, 168, 76, 0.1), transparent 55%), var(--bg-0);
   --scrollbar-thumb: #c3c9d8;
+
+  /* ambient backdrop tuning (light — deliberately subtler) */
+  --grid-line: rgba(25, 34, 64, 0.045);
+  --mote-cool: rgba(109, 25, 50, 0.55);
+  --scan-tint: rgba(109, 25, 50, 0.045);
+  --scan-tint-gold: rgba(168, 132, 47, 0.05);
   color-scheme: light;
 }
 
@@ -170,4 +182,83 @@ input[type="number"] {
   background-clip: text;
   -webkit-text-fill-color: transparent;
   animation: shimmer-sweep 3.2s linear infinite;
+}
+
+/* Brand wordmark: slow metallic sweep across the letters */
+.brand-sheen {
+  background: linear-gradient(100deg, var(--text-0) 30%, var(--gold) 50%, var(--text-0) 70%);
+  background-size: 250% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer-sweep 7s linear infinite;
+}
+
+/* Cards lift their border toward gold on hover */
+section:hover > div > h2 {
+  transition: letter-spacing 0.35s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ── Hover knowledge tooltips (feature: header/column explanations) ───── */
+.tip-anchor {
+  cursor: help;
+  text-decoration: underline dotted var(--text-4);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.tip-bubble {
+  /* Rendered in a body-level portal (see <Tip/>), so `fixed` is measured
+     against the viewport rather than a transformed/filtered ancestor. */
+  position: fixed;
+  z-index: 9999;
+  width: max-content;
+  max-width: 280px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--bg-3);
+  border: 1px solid var(--border-3);
+  box-shadow: var(--shadow-card);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.55;
+  font-weight: 500;
+  pointer-events: none;
+  text-decoration: none;
+  white-space: normal;
+  letter-spacing: 0.01em;
+}
+
+.tip-bubble .tip-title {
+  display: block;
+  color: var(--gold);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+/* subtle dashed dropzone pulse while dragging */
+@keyframes dz-pulse {
+  0%,
+  100% {
+    border-color: var(--gold-border);
+  }
+  50% {
+    border-color: var(--gold);
+  }
+}
+.dz-active {
+  animation: dz-pulse 1.1s ease-in-out infinite;
 }

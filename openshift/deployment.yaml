@@ -30,7 +30,7 @@ spec:
       containers:
         - name: web
           # Pinned by digest in GitOps (see kustomization.yaml)
-          image: quay.io/YOUR_ORG/vcapacity:2.0.0
+          image: quay.io/YOUR_ORG/vcapacity:2.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

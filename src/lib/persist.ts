@@ -27,3 +27,17 @@ export function usePersistentState<T>(key: string, initial: T): [T, Dispatch<Set
 
   return [state, setState];
 }
+
+/** Removes every persisted key with the given prefix (used by Clear buttons). */
+export function clearPersisted(prefix: string): void {
+  try {
+    const doomed: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(NS + prefix)) doomed.push(k);
+    }
+    doomed.forEach((k) => localStorage.removeItem(k));
+  } catch {
+    // non-fatal
+  }
+}
